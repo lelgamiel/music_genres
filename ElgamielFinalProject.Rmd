@@ -1,0 +1,791 @@
+---
+title: "PSTAT131 Final Project"
+author: "Laila Elgamiel"
+output:
+  html_document:
+    code_folding: hide
+    toc: true
+    df_print: paged
+---
+
+```{r setup, include=FALSE}
+#install.packages('plyr')
+#install.packages('rsample')
+#install.packages('mltools')
+#install.packages('reshape2')
+#install.packages("randomForest")
+#install.packages('caret')
+#install.packages('parsnip')
+knitr::opts_chunk$set(echo = TRUE)
+library(dplyr) 
+library(tidyverse)
+library(ggplot2)
+library(rsample)
+library(reshape2)
+library(mltools)
+library(randomForest)
+library(gbm)
+library(ISLR)
+library(tree)
+library(caret)
+library(data.table)
+library(parsnip)
+library(pROC)
+```
+
+#   INTRODUCTION 
+  
+The goal of this machine learning project is to attempt to predict the genre of about 50000 tracks obtained from the Spotify API, via Kaggle, as one of the following:  
+'Electronic', 'Anime', 'Jazz', 'Alternative', 'Country', 'Rap', 'Blues', 'Rock', 'Classical', or 'Hip-Hop'.  
+  
+Spotify is a music streaming platform with 406 million monthly users. Here is their "About Us" page for some more info:  
+[1]: https://newsroom.spotify.com/company-info/  
+  
+  
+According to Oxford Dictionary, genre is a category of artistic composition, characterized by similarities in form, style, or subject matter. With this project, I hope to gain insight into the question of whether genre is inherent to the nature of music, or if it is a product of human nature and our tendencies to look for patterns in the world around us. So, we begin...  
+  
+**Starting Off: Loading Data and Taking a Look**
+  
+For a definition of the numerous variables discussed throughout this project, reference my attached codebook.  
+
+```{r reading in dataset}
+#reading in data file
+music<-read.csv("/Users/lailaelgamiel/Desktop/PSTAT131/131FinalProject/data/music_genre.csv")
+glimpse(music) #taking a look at the initial dataset
+n_distinct(music$music_genre) #how many genres are there?
+```
+
+Right off the bat, I notice some things about this dataset. First, there are 11 distinct genres present, but only 10 listed on the Kaggle codebook from which I obtained this data. Maybe there are some null values present. Second, most of the features of this data are numerical, besides names of tracks and artist, obtained date, key, and mode. Oddly, tempo is recorded as a character variable, but the entries look to be numerical, so this is something I will have to address later on in the project. Key and mode are naturally categorical data, so they will have to be addressed via dummy or one-hot coding later on. Finally, not all of the above variables will be useful in identifying the genre of given tracks, so I will either remove them or replace them with characteristics derived from them.  
+
+To take a closer look at the distribution of each numerical variable:  
+
+```{r closer look at dataset}
+summary(music) # to see distributions of the numerical variables
+```
+
+At a glance, I see that most of the variables are recorded in the range of 0-1, besides popularity, duration, and loudness. This makes sense. Instance ID seems to be some sort of index, so theres no real meaning to its distribution.  
+  
+Onto data cleaning!  
+  
+#   DATA CLEANING
+
+```{r check uniqueness of obtained date}
+n_distinct(music$obtained_date) #unique dates
+```
+
+Right off the bat, I can determine that obtained date won't be helpful in predicting genre, as it has nothing to do with the individual tracks but rather when the data was recorded from Spotify; thus, I will go ahead and remove it before any of my EDA, so as not to distract from my analysis. Instance ID is just an index so it will be removed as well:  
+
+
+```{r remove unneccesary variables}
+#remove obtained date, instance id
+music <- music %>%
+  select(-obtained_date, -instance_id)
+```
+  
+  
+I will begin by checking for NULL values, or missing data in the dataset:  
+
+```{r checking if null values within dataset}
+music[rowSums(is.na(music)) > 0, ] #how many rows are fully null?
+```
+
+I see 5 observations that are filled with null values. Since these are so few, I will just go ahead and remove them:  
+  
+```{r remove null values from dataset}
+music <- music %>%
+  drop_na() #remove null values
+count(music) #how many observations left?
+head(music) #first 6 observations of the dataset
+```
+  
+That leaves us with 50000 observations, or individual tracks, to explore, the first 6 of which are displayed above.  
+  
+Time to deal with the mysterious character tempo, by simply converting it to a double as it should be:  
+  
+```{r dealing with tempo predictor, message=FALSE, warning=FALSE}
+music$tempo <- as.double(as.character(music$tempo))
+```
+  
+That is as much data cleaning as I can conduct initially. Perhaps the EDA will reveal more issues with the data that need to be sorted out (spoiler: it does).  
+
+#   EDA (Exploratory Data Analysis) 
+I will examine each variable's distribution by genre, as well as compare some variables against eachother.  
+  
+**GENRE**  
+  
+```{r distribution of genre training set}
+music %>%
+  ggplot(aes(music_genre, fill=music_genre)) + #color by genre
+  geom_bar() + #bar plot of genre counts
+  labs(title = "Distribution of Genre" )
+```
+  
+I can see that is data is perfectly balanced (aka it has equal distribution among genres). Upon further research, I learned that this means accuracy will be a good metric to use to determine the goodness of fit of the model later on.  
+  
+**ARTIST NAME**
+
+```{r artist name var exploration}
+n_distinct(music$artist_name) #how many unique artists?
+n_distinct(music$track_name) #how many unique songs?
+#some artist names are marked as "empty field"; how many?
+sum(music$artist_name=="empty_field")
+music %>%
+  filter(str_detect(artist_name, "empty_field")) %>%
+  head()
+```
+  
+There are 6863 unique artists present in the data, 41699 unique tracks (meaning there must be some duplicate tracks), and 2489 artist names marked as "empty_field". I won't remove these observations, because they might still be useful in helping the model predict the genre of other tracks.  
+  
+In order to make artist names possibly a bit more useful to the model, I will instead try to use the length of the names (as in how many characters are present in the string) to glean some information about their relation to genre. I will store the lengths in a new column in the dataset:  
+  
+```{r create artist name length var}
+music$Aname_length = str_length(music$artist_name) #new column of artist name lengths
+head(music$Aname_length) #first 6 observations
+```
+  
+Lets look at the distribution of artist name length by genre.  
+  
+```{r artist name exploratory plot}
+music %>%
+  ggplot(aes(x=music_genre, y=Aname_length, fill=music_genre)) + #color by genre
+  geom_boxplot() + #boxplots
+  labs(title = "Length of Artist Name by Genre", x="Genre", y="Artist Name Length" )
+```
+
+Generally, classical music artists tend to have longer names, while the rest of the genres are quite similarly distributed. This could be useful.  
+  
+**TRACK NAME**  
+  
+Looking at length of track names and creating a new column in the data to store them:  
+  
+```{r looking at length of track names}
+music$Tname_length = str_length(music$track_name) #new column of track name lengths
+head(music$Tname_length) #first 6 observations
+``` 
+  
+and once again their distributions by genre:  
+  
+```{r boxplots of genres by name length}
+music %>%
+  ggplot(aes(x=music_genre, y=Tname_length, fill=music_genre)) + #color by genre
+  geom_boxplot() + #boxplots
+  labs(title = "Length of Track Name by Genre", x="Genre", y="Track Name Length" )
+```
+  
+Here, there is a much more pronounced difference than in lengths of artist names. Generally, name length of classical tracks is greater than any other genre. I'll keep this in mind.  
+  
+**POPULARITY**  
+  
+```{r popularity exploratory plot}
+#distribution of popularity by genre
+music %>%
+  ggplot(aes(reorder(music_genre, popularity, sum), y=popularity, fill=music_genre)) + 
+  geom_col() + #barplot
+  labs(title = "Distribution of Popularity by Genre", x="Genre", y="Popularity (Totaled)")
+```
+  
+Rap, rock, and hip-hop are the most popular genres, while anime and classical are least popular, with the rest sitting somewhere in the middle.  
+  
+**ACOUSTICNESS**
+
+```{r acousticness exploratory plot}
+music %>%
+  ggplot(aes(x=music_genre, y=acousticness, fill=music_genre)) + #color by genre
+  geom_boxplot() + #boxplots
+  labs(title = "Acousticness by Genre", x="Genre", y="Acousticness" )
+```
+
+Classical is once again an outlier to the rest of the data, as well as jazz (makes sense, as classical and jazz music typically consist entirely of acoustic instruments, and very little electronic production). All other genres seem somewhat similarly distributed as being lower in acousticness. NOTE: rap and hip-hop distributions seem to consistently correspond, which makes sense because the genres are so related. I suspect acousticness to be correlated with energy, and I will explore this when I examine the energy predictor later on.  
+  
+**DANCEABILITY**  
+  
+```{r danceability exploratory}
+music %>%
+  ggplot(aes(x=music_genre, y=danceability, fill=music_genre)) + #color by genre
+  geom_boxplot() + #boxplots
+  labs(title = "Danceability by Genre", x="Genre", y="Danceability" )
+```
+  
+Classical is noticeably the least danceable genre, where as hip-hop/rap are the most danceable, and all other genres are nearly the same.  
+  
+**DURATION**  
+  
+```{r summary of duration}
+summary(music$duration_ms) #numeric distribution of duration in milliseconds
+```
+  
+There is an issue here. -1 is not a valid measurement of time, so there must be missing values. Let's take a closer look:  
+  
+```{r missing values in duration}
+sum(music$duration_ms=="-1")
+```
+  
+This is a large number of observations with missing/ invalid values of duration. I will choose to fill these missing values with the median of the duration data, so as not to lose the duration variable by having to remove it:  
+  
+```{r filling missing duration values}
+music <- music %>% 
+  mutate(duration_ms = ifelse(duration_ms==-1, #fill missing values with median
+                            median(duration_ms, na.rm = T),
+                            duration_ms))
+sum(music$duration_ms==-1)
+```
+  
+Now that I filled in the missing values, lets look at the distribution by genre:  
+  
+```{r duration exploratory plot}
+music %>%
+  ggplot(aes(x=music_genre, y=duration_ms, fill=music_genre)) + #color by genre
+  geom_boxplot() + #boxplots
+  labs(title = "Track Duration by Genre", x="Genre", y="Duration in Milliseconds" )
+```
+
+There is an extreme outlier present in the electronic genre, as well as outliers in the classical and blues genres, but since the medians of each variable are similarly distributed, I'll ignore the outliers. Overall, it seems the duration for classical tracks tends to be slightly longer than for any other genre.  
+  
+**INSTRUMENTALNESS**  
+  
+```{r examine instrumentalness}
+summary(music$instrumentalness)
+```
+  
+The minimum and 1st quartile being 0 and median and mean being very small indicate an issue in the data. A plot should give us a better look:  
+  
+```{r check instrumentalness for missing values and zeroes, message=FALSE, warning=FALSE}
+music %>%
+  ggplot(aes(instrumentalness)) + #distribution of instrumentalness
+  geom_histogram(fill="#00A36C") +
+  labs(title = "Distribution of Instrumentalness", x="Instrumentalness")
+sum(music$instrumentalness==0.0)
+```
+  
+It seems a large portion (15001 of 50000 observations, or 30%) of the instrumentalness observations equal 0. This is indicative of missing values rather than actual data points, and that is too many missing values to deal with by replacing them with the mean or median, so I will drop instrumentalness entirely from the dataset, rather than use it to build my models.  
+  
+```{r removing instrumentalness}
+music <- music %>%
+  select(-instrumentalness)
+```
+
+
+**ENERGY**
+  
+```{r energy exploratory plot}
+music %>%
+  ggplot(aes(x=music_genre, y=energy, fill=music_genre)) + #color by genre
+  geom_boxplot() + #boxplots
+  labs(title = "Energy by Genre", x="Genre", y="Energy" )
+```
+  
+Classical continues to stand apart from the rest of the genres, here in that it tends to be much less energetic, when compared to other genres.  
+  
+Energy logically seems to correlate with certain variables: acousticness, liveness, loudness, and tempo. Instead of examining each of these variables individually, I will plot energy against each of them and separate the results by genre:  
+  
+**ACOUSTICNESS**
+  
+```{r energy vs acousticness by genre}
+music %>%
+  ggplot(aes(x=energy, y=acousticness, color=music_genre)) + #color by genre
+  geom_point(alpha=0.05) + #scatterplot
+  facet_wrap(~music_genre, scales = "free") + #separate graphs by genre
+  geom_smooth(se = FALSE, color = "black", size = 1) + #add curved line
+  theme(legend.position="none") + #remove legend (it was not useful)
+  labs(title = "Energy vs Acousticness by Genre", x="Energy", y="Acousticness")
+```
+  
+I see a strong negative correlation, meaning the more energetic a song, the less acoustic it is, which is the opposite of what I originally believed.  
+  
+**LIVENESS**  
+  
+Now to compare liveness and genre:  
+  
+```{r energy vs liveness by genre}
+music %>%
+  ggplot(aes(x=energy, y=liveness, color=music_genre)) + #color by genre
+  geom_point(alpha=0.05) + #scatterplot
+  facet_wrap(~music_genre, scales = "free") + #separate graphs by genre
+  geom_smooth(se = FALSE, color = "black", size = 1) + #add curved line
+  theme(legend.position="none") + #remove legend
+  labs(title = "Energy vs Liveness by Genre", x="Energy", y="Liveness")
+```
+  
+There is very little correlation between these 2, which is surprising to me as liveness seems to indicate something energetic. This leads me to believe that liveness here is more of a measure of how "live", as in not simply recorded in a studio, the tracks are by genre. I will make note of this in my codebook.  
+  
+**LOUDNESS**  
+  
+```{r energy vs loudness by genre}
+music %>%
+  ggplot(aes(x=energy, y=loudness, color=music_genre)) + #color by genre
+  geom_point(alpha=0.05) + #scatterplot
+  facet_wrap(~music_genre, scales = "free") + #separate graphs by genre
+  geom_smooth(se = FALSE, color = "black", size = 1) + #add curved line
+  theme(legend.position="none") + #remove legend
+  labs(title = "Energy vs Loudness by Genre", x="Energy", y="Loudness")
+```
+  
+Here, I see a strong positive correlation. This make complete sense, as loudness is a measure of sound, and sound, of course, is a form of energy.  
+  
+**TEMPO**
+  
+I believe there are some missing values for the tempo predictor:  
+  
+```{r how many missing tempo values}
+sum(is.na(music$tempo))
+```
+  
+Lets replace the missing values of tempo with the median of the tempo data first:  
+  
+```{r fill missing values of tempo with median}
+music <- music %>% 
+  mutate(tempo = ifelse(is.na(tempo), #fill missing values with median
+                            median(tempo, na.rm = T),
+                            tempo))
+sum(is.na(music$tempo))
+```
+  
+Now to plot tempo against energy by genre:  
+  
+```{r energy vs tempo by genre}
+music %>%
+  ggplot(aes(x=energy, y=tempo, color=music_genre)) + #color by genre
+  geom_point(alpha=0.05) + #scatterplot
+  facet_wrap(~music_genre, scales = "free") + #separate graphs by genre
+  geom_smooth(se = FALSE, color = "black", size = 1) + #add curved line
+  theme(legend.position="none") + #remove legend
+  labs(title = "Energy vs Tempo by Genre", x="Energy", y="Tempo")
+```
+  
+There is very little correlation between tempo and energy, so I was wrong in assuming they were correlated.  
+  
+**KEY**  
+  
+What keys of music are present in the dataset?  
+  
+```{r look at key}
+unique(music$key) #what distinct keys are there in the data
+```
+  
+Because key is categorical, I will opt for barplots separated by genre to examine the distribution:  
+  
+```{r key exploratory plot}
+music %>%
+  ggplot(aes(x=key, fill=key)) + #color by genre
+  geom_bar() + #barplots
+  facet_wrap(~music_genre, scales = "free") + #separate by genre for readability
+  labs(title = "Key Distribution by Genre", x="Key")
+```
+  
+Each genre looks to have a distinct spead of key, which means this will be a helpful variable in building the model.  
+  
+Because key is a categorical variable, I will have to create dummy variables/ use One Hot Encoding to use it in my model. One Hot Encoding is when you separate the factors into various columns, and use 1s and 0s to indicate whether or not a track falls under that key.  
+  
+```{r one hot encoding key for train and test}
+music$key <- as.factor(music$key) #convert from character to factor
+music <- one_hot(as.data.table(music)) #one hot encode
+```
+  
+  
+**MODE**  
+  
+There are only two modes which music can fall under:  
+  
+```{r levels of mode}
+unique(music$mode)
+```
+  
+To put it broadly, major songs tend to sound more happy, while minor songs tend to sound more dark or sad.  
+  
+```{r mode exploratory plot}
+mycolors <- c("#FFBF00", "#00A36C") #colors of plot chosen by my sister
+music %>%
+  group_by(mode, music_genre) %>% #to separate by mode, then genre
+  count() %>% #how many observations per mode type
+  ggplot(aes(music_genre, n, fill = mode)) + #color by mode
+  geom_col(position="dodge")  + #side by side
+  scale_fill_manual(values=mycolors) + #apply chosen colors
+  labs(title = "Mode Distribution by Genre", x="Genre", y="count")
+```
+  
+There seems to be a preference towards the major key for all genres, particularly country.  
+  
+I will use One Hot Encoding for mode as well:    
+  
+```{r one hot encoding of mode for train and test}
+music$mode <- as.factor(music$mode) #convert from character to factor
+music <- one_hot(as.data.table(music)) #one hot encode
+```
+  
+  
+**SPEECHINESS**  
+  
+```{r speechiness exploratory plot}
+music %>%
+  ggplot(aes(x=music_genre, y=speechiness, fill=music_genre)) + #color by genre
+  geom_boxplot() + #boxplots
+  labs(title = "Speechiness by Genre", x="Genre", y="Speechiness" )
+```
+  
+Rap and hip-hop stick out as being particularly speechy, which should be helpful for later identification. Classical and country are hardly speechy at all.  
+  
+**VALENCE**  
+With regards to music, valence is a measure of percieved "positivity" within a song. The higher the valence, the more "upbeat" the song sounds, and vice versa.  
+  
+```{r valence exploratory plot}
+music %>%
+  ggplot(aes(x=music_genre, y=valence, fill=music_genre)) + #color by genre
+  geom_boxplot() + #boxplots
+  labs(title = "Valence by Genre", x="Genre", y="Valence" )
+```
+  
+Classical stands out as having lower valence on average than other genres.  
+  
+**EDA Final Touches**  
+  
+Because I extracted the lengths of both the artist and track names, I will drop the original variables and keep the new ones to maintain independence among predictors.  
+  
+```{r dropping artist and track name from test/train}
+music <- music %>%
+  select(-artist_name, -track_name) #drip artist and track name
+```
+  
+Overall, I notice that for a lot of the features, genres tend to have very similar distributions to each other, with the exception of one or two genres each time. This tells me it will be hard to build a model that flawlessly distinguishes between genre every time.  
+  
+Thus, I will focus on building and choosing the best possible model, even if it is not perfectly accurate in nature.  
+  
+#   MODEL PREPARATION
+  
+First, I will separate labels (predictions) from features (predictors):  
+  
+```{r separate labels from features}
+music_features <- music %>%
+  select(-music_genre) #predictors
+music_labels <- music %>% 
+  select(music_genre) #predictions
+```
+  
+Next, I will scale the features, which means I will center the data of each predictor variable around 0, and normalize it to have a standard deviation of 1. This will help keep things even across the board when when building and comparing the models. I will separate the One Hot Encoded variables from the data prior to scaling, as scaling and normalizing a bunch of 1s and 0s does not make any sense intuitively (like taking the average of true and false). Then, I will scale the necessary features and reattach the two data frames. Finally, I will transform genre into a factor rather than a set of character variables to I can actually go about making predictions.  
+  
+```{r scaling features minus one hot encoded vars}
+#separate numeric features and place in one data frame
+to_scale <- music_features %>%
+  select(popularity, acousticness, danceability, duration_ms, energy, liveness, loudness,
+         speechiness, tempo, valence, Aname_length, Tname_length) 
+#separate one hot encoded features and place in second data frame
+features_encoded <- music_features %>%
+  select(-popularity, -acousticness, -danceability, -duration_ms, -energy, -liveness,
+         -loudness, -speechiness, -tempo, -valence, -Aname_length, -Tname_length)
+#scale the chosen numerical features
+features_scaled <- to_scale %>%
+  scale() %>%
+  as.data.frame()
+colMeans(features_scaled) #all equal (basically) 0
+#rejoin the 2 data frames into one
+features_processed <- as.data.frame(c(features_scaled, features_encoded)) 
+#make genre a factor rather than character type
+features_processed$music_genre <- as.factor(music_labels$music_genre)
+glimpse(features_processed)
+```
+  
+Now that I have my final version of the dataset, processed as necessary, I will split the data into a training and test set upon which to analyze and compare my model predictions to.  
+  
+#   DATA SPLIT
+  
+Here, I split the data into an 80% training, 20% test set, using stratified sampling. I used stratified sampling to increase randomness, particularly in the genre, as the dataset looks to have long stretches of entries with the same genre in a row.  
+  
+```{r data split}
+set.seed(123) #to ensure replicability when randomly splitting and stratifying data
+music_split <- features_processed %>% 
+  initial_split(prop = 0.8, strata = "music_genre") #80/20 split with stratified sampling
+
+music_train <- training(music_split) #80 goes to training set
+music_test <- testing(music_split) #20 goes to test set
+glimpse(music_train) #taking a look at training set
+```
+  
+While training my models using repeated cross validation, I learned that it was quite a lengthy process on my machine. Thus, I decided to write my models to external .rda files, so that I could load the files in later on to access the models without having to rerun the cross validation, or force the knittr to rerun cross validation every time I tried to knit my project (one attempt to knit even took over 20 hours before I decided to do this). Quickly grabbing my current working directory so I know where to write the files to..  
+  
+```{r folding training data}
+getwd()
+```
+  
+and now onto actually training and building the models. Exciting!  
+  
+#   MODEL BUILDING  
+  
+For my project, because I am working to predict categorical data, I decided to build a few classification models, including the following, using repeated cross validation. I did so primarily using the *caret* package, so that the training data could be folded within the building of the model, using the *trainControl()* function:  
+  
+1. Random Forest  
+2. Boosted Trees  
+3. k-NN (k Nearest Neighbors)  
+4. SVM (Support Vector Machine)  
+  
+**Random Forest**
+
+Over the many times I had to run this process, it took an average of two hours to run each time; originally, I attempted to train and tune the model with repeated cross validation, but the runtime was simply too exhaustive on my machine (over 4 hours, and going) for me to justify keeping it in. Thus, I trained this model using only 10 fold cross validation with no repeats.  
+  
+I chose a maximum of 25 for my tuning grid for the mtry parameter because my training set contains 26 predictors.  
+  
+After training the model and saving it to an external .rda file, I completely commented the code out, as setting cache=TRUE in the r header was being ignored by the knittr for some reason.  
+  
+```{r rf with tuning attempt, cache=TRUE}
+#rf.fitControl <- trainControl(method="cv", number=10) 10 fold cross validation
+#tunegrid <- expand.grid(.mtry=c(2:25)) between 2 and 25 for my parameters
+#rf_music2 <- train(music_genre ~., data=music_train, method="rf", 
+#               tuneGrid=tunegrid, ntree = 100, trControl=rf.fitControl)
+#rf_music2
+#save(rf_music2, file = "/Users/lailaelgamiel/Desktop/PSTAT131/131FinalProject/rfModel.rda")
+```
+  
+The optimal value for the mtry parameter was determined by accuracy=55%, and set to be 7 by the tuning process. Now to load the model back in from the external .rda so I can actually examine it and use it to predict on the test data.  
+  
+```{r load in rf model from rda file}
+load("rfModel.rda") #load random forest model from external file
+```
+  
+I plotted the performance of the random forest model to see the progression of the tuning process:  
+  
+```{r performance plot of RF model}
+ggplot(rf_music2) #performance plot of random forest
+```
+  
+It seems performance of the model rapidly increased until mtry=7, then slowly tapered off as the mtry parameter value increased. Interestingly, an mtry value of 11 came in a close second to the optimal value.  
+  
+Now, to build the random forest model with the optimal value of mtry achieved by tuning and predict on the test set. I created a confusion matrix so as to see the ratio of correct predictions to incorrect predictions by the model:  
+  
+```{r predicting using random forest model with optimal mtry}
+rf.music <- predict(rf_music2, music_test) #predicting on test set
+#building confusion matrix to compare predictions to actual test data
+confusionMatrix(reference = music_test$music_genre, data = rf.music, mode='everything')
+```
+
+The accuracy for mtry=7 random forest model is about 54% on test data, almost exactly like on training data (55%). I believe this indicates that the model did not overfit to the training set, which I was slightly worried about because of the 80/20 ratio I used for the training and test split.  
+  
+From the confusion matrix, I see that the model often confused hip-hop for rap, and rap for hip-hop, which makes sense because of the similarity of the genres. This makes me believe the models I fit may perform better if I were to combine the two genres, but I wanted to keep the data as pure as possible for this project to test the ability of specific genre distinctions.  
+  
+Rock/ alternative and rock/ country also had similar overlap within the confusion matrix.  
+  
+Now, to take a look at which variables were most important to the model:  
+  
+```{r plotting importance of rf predictors}
+varImpRF<-varImp(rf_music2) #order of variable importance to random forest model
+ggplot(varImpRF, main="Variable Importance with Random Forest") #plot importance
+```
+  
+Popularity was by far the most important feature when it comes to predicting genre, along with loudness, speechiness, and danceability (I assume for distinguishing rap and hip-hop). Key and mode seem to be least important, but this is a misclassification of key particularly, as it was split 12 ways when it was One Hot Encoded earlier. Therefore, I will take mode and liveness to be the true least important variables.  
+  
+Because popularity is so crucial to the determination of genre, I am led to believe that genre is less of an inherest characteristic of music, but rather of phenomenon of how humans interact with music, and attempt to find patterns in it. More on this later...  
+  
+  
+**Boosted Trees**
+  
+Next, I decided to fit a boosted tree model to the training set, and train the model using 10 fold cross validation, repeated three times to keep my machine from suffering through 3 hour+ runtimes. Training and tuning this model took just under 3 hours. Once again, I wrote the model to an external file to help keep things quick and simple. 
+  
+```{r boosted trees model, cache=TRUE}
+#gbmFitControl <- trainControl(## 10-fold CV
+#                           method = "repeatedcv",
+ #                          number = 10,
+  #                         ## repeated three times
+   #                        repeats = 3)
+#gbmFit1 <- train(music_genre ~ ., data = music_train, 
+ #                method = "gbm", 
+  #               trControl = gbmFitControl)
+#gbmFit1
+#save(gbmFit1, file = "/Users/lailaelgamiel/Desktop/PSTAT131/131FinalProject/boostModel.rda")
+```
+  
+The results of the optimal tuned parameters are as follows:  
+  
+150: Optimal number of trees (number of iterations)  
+3: Optimal interaction depth (complexity of the tree)  
+0.1: Optimal learning rate (how fast the algorithm adapts, $\lambda$)  
+  
+Now to load the boost model from the external file:  
+  
+```{r loading in boost model from rda}
+load("boostModel.rda") #loading boost model from external file
+```
+  
+Plotting the performance of the boosted model:  
+  
+```{r performance plot of boost model}
+ggplot(gbmFit1)
+```
+  
+I assessed that accuracy would continue to taper off as the number of boosting iterations increased, so I stuck with the chosen tuned value of 150. Now onto predicting on the test set and building another confusion matrix:  
+  
+```{r boost predictions with tuned parameters}
+boost.music <- predict(gbmFit1, music_test) #predicting on test data
+#building confusion matrix to compare predictions to actual test data
+confusionMatrix(reference = music_test$music_genre, data = boost.music, mode='everything')
+```
+  
+Here we see the boost model is 57% accurate, which is an improvement, however small, from the previously trained random forest model. Once again, hip-hop and rap were greatly confused for each other, alongside country/ rock, jazz/ blues, and alternative/ rock. Looking at variable importance once more:  
+  
+```{r variable importance of boost}
+varImpBoost<-varImp(gbmFit1) #ordered variable importance
+ggplot(varImpBoost, main="Variable Importance with BOOST") #plotting importance
+```
+  
+In the boosted model, predictors popularity, loudness, speechiness, and danceability are the most important, just like in the random forest model. Once again, liveness and mode are the least important features of the model, although now the least important variables as well as tempo, duration, and energy are far less important that in the random forest model. This model being more picky with its predictors is actually a good sign in terms of it being a robust model.  
+  
+**k-NN**
+  
+Training and tuning the k nearest neighbors model only took around 40 minutes. Again, I used 10 fold cross validation repeated thrice, and wrote the model to an external file.  
+  
+```{r tuning knn model, cache=TRUE}
+#knnFitControl <- trainControl(## determine k for best number of neighbors
+#                           method = "repeatedcv",
+#                           ## 10 folds
+#                           number= 10,
+                           ## repeated three times
+#                           repeats = 3)
+#knnFit1 <- train(music_genre ~ ., data = music_train, 
+#                 method = "knn", 
+#                 trControl = knnFitControl)
+#knnFit1
+#save(knnFit1, file = "/Users/lailaelgamiel/Desktop/PSTAT131/131FinalProject/knnModel.rda")
+```
+  
+The only parameter being tuned in this model is of course k, or the ideal number of neighbors. Loading it in:  
+  
+```{r load in knn model from rda}
+load("knnModel.rda")
+```
+  
+and plotting the performance:  
+  
+```{r performance plot of knn model}
+ggplot(knnFit1)
+```
+  
+The accuracy looks like it would have continued to increased linearly as the number of neighbors increased, and I'm really not sure why that is. I chose to stick with the tuned value chosen by the model to avoid overcomplicating things.  
+  
+Once again, onto prediction and confusion matrix.
+  
+```{r prediction and confusion matrix for knn}
+knn.music <- predict(knnFit1, music_test)
+confusionMatrix(reference = music_test$music_genre, data = knn.music, mode="everything")
+```
+
+The accuracy of k-NN model with k=9 comes in at 49%. This model really seemed to confuse hip for rap and vice versa, as with all my previous models. In fact, it seemed to confuse more genres for other than any of my other models, like hip-hop/alternative, jazz/country, and country/blues. Overall, it was most sensitive to classical music, which makes sense as it was continuously differentiated from other genres as seen in the EDA.  
+  
+```{r variable importance of kNN}
+varImpKNN<-varImp(knnFit1) #order of variable importance
+ggplot(varImpKNN, main="Variable Importance with k-NN") #plotting variable importance
+```
+  
+A bit hard to see, but popularity is definitely most important feature across genres, besides rock which benefits slightly more from loudness. Interestingly, loudness is also important for identifying anime and electronic tracks. Loudness is not nearly as important for genres like hip-hop, rap, jazz, blues, classical, and country.  
+  
+  
+**SVM**
+  
+I chose not to conduct PCA and simply train the SVM model on the data as is, as my data had a mix of continuous and categorical (key and mode) data, and upon researching and seeing conflicting opinions, I learned that typically PCA is not useful when data has One Hot Encoded variables (all 0s and 1s), and it can skew the weight of the principal components.  
+  
+Training and tuning this model took a bit over an hour, so I wrote it to an external file as before:  
+  
+```{r tune and build SVM model}
+#svmFitControl <- trainControl(## 10-fold CV
+#                           method = "repeatedcv",
+#                           number = 10,
+#                           ## repeated three times
+#                           repeats = 3)
+#svmFit1 <- train(music_genre ~ ., data = music_train, 
+#                 method = 'svmLinear', #chose a linear kernel for classification
+#                 trControl = svmFitControl)
+#svmFit1
+#save(svmFit1, file = "/Users/lailaelgamiel/Desktop/PSTAT131/131FinalProject/svmModel.rda")
+```
+  
+There was only one parameter to tune here (C, as the kernel was linear).  
+  
+Loading in the final model:  
+  
+```{r load in svm model from rda}
+load("svmModel.rda")
+```
+
+
+
+```{r SVM prediction and confusion matrix}
+svm.music <- predict(svmFit1, music_test)
+confusionMatrix(reference = music_test$music_genre, data = svm.music, mode='everything')
+```
+  
+The SVM model has an accuracy of about 53%, almost as accurate as the random forest model. Let us check out which variables are most important for SVM:  
+  
+```{r variable importance of svm}
+varImpSVM<-varImp(svmFit1)
+ggplot(varImpSVM, main="Variable Importance with Support Vector Machines (SVM)")
+```
+  
+Similarly to k-NN, rock favored loudness slightly, but popularity beat out all other predictors in terms of importance between genres.  
+  
+Now to compare each model's performance against eachothers:  
+  
+#   MODEL PERFORMANCE
+  
+```{r compare model performances}
+# Compare model performances using resample()
+# Could not compare against random forest model as I could not do repeated CV
+# thus resulting in a different number of resamples between these models and RF.
+models_compare <- resamples(list(BOOST=gbmFit1, KNN=knnFit1, SVM=svmFit1))
+# Summary of the models performances
+summary(models_compare)
+```
+  
+Plotting the above comparisons for visual ease:  
+  
+```{r plot comparison of model performances}
+scales <- list(x=list(relation="free"), y=list(relation="free"))
+bwplot(models_compare, scales=scales)
+```
+  
+Thus, the boosted model is the most accurate of the three models plotted here, and when comparing the accuracy of the boosted model (57%) to the accuracy of the random forest model (54%), I can see that the boosted model still beats it out.  
+  
+CHOSEN MODEL BASED ON ACCURACY: BOOST  
+  
+#   FINAL MODEL BUILDING 
+  
+```{r final model}
+final_model <- gbmFit1 #chosen model is boosted model
+```
+  
+  
+**Checking a few predictions**  
+  
+```{r check some predictions head}
+predict(final_model, newdata = head(music_test)) #predicted values
+head(music_test$music_genre) #actual test values
+```
+  
+It seems even the best model was only able to correctly predict 3 out of the first 6 entries of the test set, (~50% accuracy).  
+  
+```{r check tail predictions}
+predict(final_model, newdata = tail(music_test)) 
+tail(music_test$music_genre)
+```
+  
+Of the last 6 entries of the test set, the model once again correctly predicted the genre 3 out of 6 times.  
+  
+  
+#   CONCLUSION 
+  
+Overall, of the four models I built and trained on the final cleaned and transformed dataset, the boosted tree model performed best based on accuracy of predictions on the test set, but not by much. It seems that regardless of the model I chose to train and test, the accuracy never seemed to cross the threshold of 60%. This led me to a few different conclusions.    
+  
+First, I do not believe any of my models were particularly effective because it seems that among the genres present in the dataset, quite a few shared too many similarities to be properly separated by the model. In particular, rap and hip-hop, rock and country, and jazz and blues seemed to always be lumped together. This is not necessarily surprising, as I personally would have a difficult time distinguishing between some of these genres depending on the track. I do believe some of these models would have performed much better differentiating between genres if certain combinations of genres were lumped together. That is certainly an idea for the next steps I could take if I were to continue this analysis of genre. Perhaps if I grouped certain genres together, I could build a model that was more accurate, or I could choose to build a model that was focused only on being incredibly good at identifying whether or not a track fell under a specific genre, like classical.  
+  
+This leads me to my second conclusion. I noticed that regardless of which model I looked at, classical was always significantly more distinguishable than other genres. The boosted model was also fairly sensitive to anime and rock, which generally were indistinguishable while analyzing spreads across genres in my EDA. This was one of the more surprising things about my analysis.  
+  
+Finally, I am able to conclude that while certain inherent characteristics of music lead to the specification of a genre, the more specific the specifications of a genre gets, the more difficult it is to categorize music only by what genre it falls under. You could theoretically come up with thousands of sub genres underneath any single genre, as record companies often do, but it wouldn't be nearly as useful of a classification tool at that point. While this model was interesting to examine, and showed me just how complex and varied the nature of music is, it was not super useful in helping classify songs. Music as a whole is much more enjoyable when we don't give too much thought to genre, anyways.  
+  
+![Thanks for a great quarter!](/Users/lailaelgamiel/Desktop/PSTAT131/131FinalProject/data/smileyMusic.png)
+
+
+
+
+
+
+
+
+
+
+
+
+
